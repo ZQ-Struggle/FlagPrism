@@ -235,23 +235,3 @@ may be unavailable. The report must preserve that distinction: a missing record
 does not establish that an operation produced zero or never executed. Partial
 collection, including buffer overflow, must also remain visible so that users
 can decide whether to narrow the region or repeat the run with more capacity.
-
-## Portability and Trade-offs
-
-Architecture independence comes from placing reusable observation and analysis
-logic above device-specific details. Source association, collection choices,
-record interpretation, and report organization can be shared. Backends supply
-the mechanisms needed to execute the inserted code and retrieve its results.
-Support for a new accelerator can therefore grow incrementally, with basic
-observations available before every timing source or vendor metric is integrated.
-
-Profiler and Debugger share this foundation but ask different questions.
-Profiling favors records that explain activity and cost; debugging favors records
-that explain values and data flow. Reusing collection machinery does not require
-both tools to collect all kinds of data on every run.
-
-Instrumentation has a cost. Extra computation, memory writes, and data transfer
-can change the behavior being measured. Selecting a region, using summaries,
-and limiting collection volume make that cost manageable. Detailed observations
-are most useful when interpreted together with their collection settings and
-the capabilities of the selected backend.
