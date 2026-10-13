@@ -11,27 +11,11 @@ values and memory accesses and presents them alongside the source statements
 that produced them. Together, they provide a consistent way to investigate
 performance and correctness across different accelerator backends.
 
-## Core Idea: Observe Programs Through Instrumentation
-
-Instrumentation means adding small pieces of observation code to a program.
-These additions run with the program and record information that would otherwise
-be lost after execution. FlagPrism uses compiler instrumentation to look inside
-Triton kernels, then combines the observations with information saved during
-compilation to produce readable reports.
-
-The main observation point is the intermediate representation, or IR: the
-compiler's representation of a program between source code and device code.
-At this level, operations still describe meaningful work such as loading a
-tensor, adding values, or storing a result. The compiler also knows properties
-such as data types and tensor shapes. This provides useful context for choosing
-what to record and explaining the results later.
-
-Working at the IR level also provides a basis for architecture-independent
-profiling and debugging. Much of the observation logic can be expressed before
-the program is translated into instructions for a particular device. FlagTree's
-backends compile that logic alongside the original computation. Device-specific
-adapters handle the remaining differences, including memory allocation, data
-transfer, synchronization, and access to clocks or hardware metrics.
+To make profiling and debugging portable across architectures, FlagPrism inserts
+observation code into Triton IR before device-specific compilation. FlagTree's
+backends compile that code alongside the original computation. Backend adapters
+handle memory allocation, data transfer, synchronization, and access to clocks
+or hardware metrics.
 
 The overall flow has two connected parts. Compilation produces an instrumented
 kernel and metadata: descriptions of the source, operations, and observation
