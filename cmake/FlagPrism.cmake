@@ -20,9 +20,11 @@ option(TRITON_BUILD_FLAGPRISM
        "Build the bundled FlagPrism debugger and profiler"
        ${_flagprism_default})
 
-set(_flagprism_supported_backends all ascend mthreads tianshu)
+set(_flagprism_supported_backends all ascend mthreads tianshu enflame nvidia)
 set(_flagprism_backend_default "all")
-if(FLAGTREE_BACKEND STREQUAL "ascend")
+if(FLAGTREE_BACKEND STREQUAL "enflame")
+  set(_flagprism_backend_default "enflame")
+elseif(FLAGTREE_BACKEND STREQUAL "ascend")
   set(_flagprism_backend_default "ascend")
 elseif(FLAGTREE_BACKEND STREQUAL "tianshu" OR
        FLAGTREE_BACKEND STREQUAL "iluvatar" OR
@@ -31,26 +33,37 @@ elseif(FLAGTREE_BACKEND STREQUAL "tianshu" OR
 elseif(FLAGTREE_BACKEND STREQUAL "mthreads" OR
        FLAGTREE_BACKEND STREQUAL "musa")
   set(_flagprism_backend_default "mthreads")
+elseif(FLAGTREE_BACKEND STREQUAL "nvidia" OR
+       FLAGTREE_BACKEND STREQUAL "cuda")
+  set(_flagprism_backend_default "nvidia")
 endif()
 if(NOT FLAGPRISM_BACKEND)
   set(FLAGPRISM_BACKEND "${_flagprism_backend_default}" CACHE STRING
-      "FlagPrism vendor backend to compile (all, ascend, mthreads, or tianshu)" FORCE)
+      "FlagPrism vendor backend to compile (all, ascend, mthreads, tianshu, enflame, or nvidia)" FORCE)
 endif()
 string(TOLOWER "${FLAGPRISM_BACKEND}" FLAGPRISM_BACKEND)
-set_property(CACHE FLAGPRISM_BACKEND PROPERTY STRINGS all ascend mthreads tianshu)
+# FlagPrism: accept the CUDA spelling used by existing FlagTree build
+# invocations, while keeping NVIDIA as the canonical backend name internally.
+if(FLAGPRISM_BACKEND STREQUAL "cuda")
+  set(FLAGPRISM_BACKEND "nvidia")
+endif()
+set_property(CACHE FLAGPRISM_BACKEND PROPERTY STRINGS all ascend mthreads tianshu enflame nvidia)
 if(NOT FLAGPRISM_BACKEND IN_LIST _flagprism_supported_backends)
   message(FATAL_ERROR
     "Unsupported FLAGPRISM_BACKEND='${FLAGPRISM_BACKEND}'. "
-    "Choose all, ascend, mthreads, or tianshu.")
+    "Choose all, ascend, mthreads, tianshu, enflame, or nvidia.")
 endif()
 set(FLAGPRISM_BUILD_VENDOR_LOWERING OFF)
-if(FLAGPRISM_BACKEND STREQUAL "all")
+if(FLAGPRISM_BACKEND STREQUAL "all" OR
+   FLAGPRISM_BACKEND STREQUAL "nvidia")
   set(FLAGPRISM_BUILD_VENDOR_LOWERING ON)
 endif()
 message(STATUS "FlagPrism vendor backend: ${FLAGPRISM_BACKEND}")
 
 function(flagprism_apply_backend_compile_definitions target)
-  if(FLAGPRISM_BACKEND STREQUAL "mthreads")
+  if(FLAGPRISM_BACKEND STREQUAL "enflame")
+    target_compile_definitions(${target} PRIVATE FLAGPRISM_BACKEND_ENFLAME=1)
+  elseif(FLAGPRISM_BACKEND STREQUAL "mthreads")
     target_compile_definitions(${target}
       PRIVATE FLAGPRISM_BACKEND_MTHREADS=1)
   elseif(FLAGPRISM_BACKEND STREQUAL "tianshu")
@@ -59,20 +72,30 @@ function(flagprism_apply_backend_compile_definitions target)
   elseif(FLAGPRISM_BACKEND STREQUAL "ascend")
     target_compile_definitions(${target}
       PRIVATE FLAGPRISM_BACKEND_ASCEND=1)
+  elseif(FLAGPRISM_BACKEND STREQUAL "nvidia")
+    # FlagPrism: identify the NVIDIA-only build so vendor registration can
+    # avoid pulling in unrelated accelerator SDKs.
+    target_compile_definitions(${target}
+      PRIVATE FLAGPRISM_BACKEND_NVIDIA=1)
   endif()
 endfunction()
 
 function(flagprism_enable_debugger_runtime target)
-  if(FLAGPRISM_BACKEND STREQUAL "mthreads")
+  if(FLAGPRISM_BACKEND STREQUAL "enflame")
+    flagtree_debugger_enable_enflame(${target})
+  elseif(FLAGPRISM_BACKEND STREQUAL "mthreads")
     flagtree_debugger_enable_musa(${target})
   elseif(FLAGPRISM_BACKEND STREQUAL "tianshu")
     flagtree_debugger_enable_corex(${target})
   elseif(FLAGPRISM_BACKEND STREQUAL "ascend")
     flagtree_debugger_enable_cann(${target})
+  elseif(FLAGPRISM_BACKEND STREQUAL "nvidia")
+    flagtree_debugger_enable_cuda(${target})
   else()
     flagtree_debugger_enable_cann(${target})
     flagtree_debugger_enable_corex(${target})
     flagtree_debugger_enable_musa(${target})
+    flagtree_debugger_enable_cuda(${target})
   endif()
 endfunction()
 

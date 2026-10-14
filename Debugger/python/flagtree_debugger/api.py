@@ -6,11 +6,13 @@ from datetime import datetime
 import hashlib
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import pprint
 import re
 import sys
+import struct
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -26,6 +28,7 @@ class DebuggerConfig:
     enabled: bool = False
     record_level: int = 1
     addr_level: int = 0
+    timeline_enabled: bool = False
     export_mode: str = "POST_KERNEL_EXPORT"
     record_capacity: int = 1024
     export_on_error: bool = False
@@ -49,6 +52,7 @@ _record_capacity = _DEFAULT_RECORD_CAPACITY
 _export_mode = _DEFAULT_EXPORT_MODE
 _export_on_error = _DEFAULT_EXPORT_ON_ERROR
 _raw_record_export_enabled = False
+_timeline_enabled = False
 _active_config = DebuggerConfig()
 _exported_runs: list[dict[str, Any]] = []
 _CONFIG_KEYS = frozenset({
@@ -57,6 +61,7 @@ _CONFIG_KEYS = frozenset({
     "export_mode",
     "export_on_error",
     "export_raw_records",
+    "timeline",
 })
 _DISABLED_BUILD_MESSAGE = (
     "FlagPrism debugger native support is unavailable. Reinstall FlagTree with "
@@ -125,11 +130,11 @@ def configure(config: Mapping[str, Any] | None = None, **kwargs: Any) -> None:
     """Update debugger defaults used by the next ``activate(level=...)``.
 
     Supported keys are ``output_dir``, ``record_capacity``, ``export_mode``,
-    ``export_on_error``, and ``export_raw_records``. Keys not provided keep
-    their current values.
+    ``export_on_error``, ``export_raw_records``, and ``timeline``. Keys not
+    provided keep their current values.
     """
     global _output_dir, _record_capacity, _export_mode
-    global _export_on_error, _raw_record_export_enabled
+    global _export_on_error, _raw_record_export_enabled, _timeline_enabled
 
     updates = {}
     if config is not None:
@@ -154,6 +159,8 @@ def configure(config: Mapping[str, Any] | None = None, **kwargs: Any) -> None:
         _export_on_error = bool(updates["export_on_error"])
     if "export_raw_records" in updates:
         _raw_record_export_enabled = bool(updates["export_raw_records"])
+    if "timeline" in updates:
+        _timeline_enabled = bool(updates["timeline"])
 
 
 def reset_config() -> None:
@@ -164,6 +171,7 @@ def reset_config() -> None:
         export_mode=_DEFAULT_EXPORT_MODE,
         export_on_error=_DEFAULT_EXPORT_ON_ERROR,
         export_raw_records=False,
+        timeline=False,
     )
 
 
@@ -175,6 +183,7 @@ def get_config() -> dict[str, Any]:
         "export_mode": str(_export_mode),
         "export_on_error": bool(_export_on_error),
         "export_raw_records": bool(_raw_record_export_enabled),
+        "timeline": bool(_timeline_enabled),
     }
 
 
@@ -203,6 +212,13 @@ def _normalize_addr_level(addr_level: int) -> int:
     value = int(addr_level)
     if value < 0 or value > 2:
         raise ValueError("debugger addr_level must be 0, 1, or 2")
+    return value
+
+
+def _normalize_record_level(record_level: int) -> int:
+    value = int(record_level)
+    if value not in (1, 2):
+        raise ValueError("debugger level must be 1 or 2")
     return value
 
 
@@ -326,7 +342,7 @@ def _render_raw_records(exported_run: dict[str, Any], decoded: dict[str, Any],
 
 
 def _is_full_dump_run(metadata_dict: dict[str, Any]) -> bool:
-    return (int(metadata_dict.get("debug_record_level", 1)) == 2 and int(
+    return (int(
         metadata_dict.get("debug_full_dump_payload_bytes_per_instance", 0)) > 0
             and bool(metadata_dict.get("debug_full_dump_plan")))
 
@@ -479,6 +495,7 @@ def _write_full_dump_artifacts(
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: list[dict[str, Any]] = []
+    inactive: list[dict[str, Any]] = []
     records = decoded.get("records", [])
     for slot_index, record in enumerate(records):
         if not isinstance(
@@ -492,8 +509,25 @@ def _write_full_dump_artifacts(
         payload_offset = int(record.get("payload_offset", 0))
         payload_length = int(record.get("payload_length", 0))
         if payload_length <= 0:
+            if payload_length == 0 and payload_offset == 0 and plan.get(
+                    "conditional"):
+                inactive.append({
+                    "op_id":
+                    int(record["op_id"]),
+                    "logical_instance_id":
+                    int(record["logical_instance_id"]),
+                    "record_index":
+                    record_index,
+                    "reason":
+                    "unexecuted_control_flow"
+                })
+                continue
             raise RuntimeError(
                 f"empty full-dump payload for record_index={record_index}")
+        if payload_length != int(plan["payload_length"]):
+            raise RuntimeError(
+                f"full-dump payload size differs from plan for record_index={record_index}"
+            )
         if payload_offset < 0 or payload_offset + payload_length > len(
                 raw_buffer):
             raise RuntimeError(
@@ -522,11 +556,29 @@ def _write_full_dump_artifacts(
             "path": str(artifact_path),
         })
 
-    expected_records = len(plan_by_record)
-    if expected_records and not artifacts:
-        raise RuntimeError(
-            "level-2 debugger did not produce any full-dump artifacts")
+    if plan_by_record and not artifacts:
+        # Empty output is valid only if every planned capture in every program
+        # instance was explicitly classified as unexecuted control flow.
+        instance_count = math.prod(runtime_metadata.get("grid") or (1, ))
+        expected = {(record_index, instance)
+                    for instance in range(instance_count)
+                    for record_index in plan_by_record}
+        inactive_records = {(r["record_index"], r["logical_instance_id"])
+                            for r in inactive}
+        if not expected or inactive_records != expected:
+            raise RuntimeError(
+                "level-2 debugger did not produce any full-dump artifacts")
 
+    inactive_keys = {(r["op_id"], r["logical_instance_id"]) for r in inactive}
+    active_keys = {(a["op_id"], a["logical_instance_id"]) for a in artifacts}
+    if inactive_keys & active_keys:
+        raise RuntimeError(
+            "Partially missing L2 payloads for an executed operation")
+    runtime_metadata["inactive_record_slots"] = [
+        slot for slot, record in enumerate(records)
+        if (record["op_id"], record["logical_instance_id"]) in inactive_keys
+    ]
+    runtime_metadata["inactive_full_dump_records"] = inactive
     index_path = artifact_dir / "tensor_index.json"
     index = {
         "kernel_name":
@@ -538,6 +590,8 @@ def _write_full_dump_artifacts(
         _exported_run_meta(exported_run).get("run_id", 0),
         "artifacts":
         artifacts,
+        "inactive_records":
+        inactive,
     }
     index_path.write_text(json.dumps(index, indent=2, sort_keys=True))
     runtime_metadata["full_dump_artifacts"] = artifacts
@@ -789,6 +843,69 @@ def _inject_precision_diagnostics(report: str,
     return json.dumps(document, indent=2, sort_keys=True)
 
 
+def _fill_summary_bundles_from_full_dump(exported_run, decoded, metadata,
+                                         artifacts):
+    """Derive L2 summaries from actual device payloads, retaining the record ABI."""
+    import numpy as np
+
+    by_value = {
+        (a["op_id"], a["logical_instance_id"]): a
+        for a in artifacts if a["kind"] == "value"
+    }
+    raw = bytearray(exported_run["raw_buffer"])
+    record_size = int(metadata["debug_record_size"])
+    computed = {}
+    device_summary_ops = set()
+    host_summary_ops = {
+        int(entry["op_id"])
+        for entry in metadata.get("debug_full_dump_plan", [])
+        if entry["kind"] == "value"
+    }
+    inactive_slots = set(exported_run["runtime_metadata"].get(
+        "inactive_record_slots", []))
+    for slot, record in enumerate(decoded["records"]):
+        if slot in inactive_slots:
+            continue
+        kind = record["record_kind"]
+        if kind not in {
+                "SUMMARY_COUNT_BUNDLE_U64", "SUMMARY_VALUE_BUNDLE_F32"
+        }:
+            continue
+        if record["op_id"] not in host_summary_ops:
+            device_summary_ops.add(record["op_id"])
+            continue
+        key = (record["op_id"], record["logical_instance_id"])
+        if key not in computed:
+            if key not in by_value:
+                raise RuntimeError(
+                    f"Missing L2 value payload for summary {key}")
+            values = np.load(by_value[key]["path"],
+                             allow_pickle=False).astype(np.float32).reshape(-1)
+            finite = values[np.isfinite(values)]
+            counts = (int(np.isnan(values).sum()), int(np.isinf(values).sum()),
+                      int((values == 0).sum()), int(values.size))
+            with np.errstate(over="ignore", invalid="ignore"):
+                metrics = (float(finite.mean()) if finite.size else 0.0,
+                           float(finite.min()) if finite.size else 0.0,
+                           float(finite.max()) if finite.size else 0.0,
+                           float(
+                               np.sqrt(
+                                   np.sum(finite * finite, dtype=np.float32))))
+            computed[key] = counts, metrics
+        counts, metrics = computed[key]
+        offset = 32 + slot * record_size + 16
+        if kind == "SUMMARY_COUNT_BUNDLE_U64":
+            struct.pack_into("<4Q", raw, offset, *counts)
+        else:
+            struct.pack_into("<4f", raw, offset, *metrics)
+    exported_run["raw_buffer"] = bytes(raw)
+    exported_run["runtime_metadata"]["host_summary_op_ids"] = sorted(
+        host_summary_ops)
+    exported_run["runtime_metadata"]["summary_source"] = (
+        "mixed_device_and_host_from_device_full_dump"
+        if device_summary_ops else "host_from_device_full_dump")
+
+
 def _finalize_exported_run(exported_run: dict[str, Any],
                            metadata_dict: dict[str, Any]) -> dict[str, Any]:
     exported_run["debug_kernel_name"] = str(
@@ -818,6 +935,11 @@ def _finalize_exported_run(exported_run: dict[str, Any],
                 "level-2 debugger full dump requires debugger output_dir")
         artifacts = _write_full_dump_artifacts(report_path, exported_run,
                                                decoded, metadata_dict)
+        if metadata_dict.get("debug_host_summary_bundles"):
+            _fill_summary_bundles_from_full_dump(exported_run, decoded,
+                                                 metadata_dict, artifacts)
+        decoded = binding.decode_exported_run(exported_run)
+        exported_run["decoded"] = decoded
         precision_diagnostics = _build_precision_diagnostics(
             metadata_dict, artifacts)
         if precision_diagnostics:
@@ -880,6 +1002,21 @@ def _finalize_exported_run(exported_run: dict[str, Any],
             op_log_json_report = _inject_precision_diagnostics(
                 op_log_json_report, precision_diagnostics, op_log=True)
             exported_run["op_log_json_report"] = op_log_json_report
+
+    summary_source = exported_run.get("runtime_metadata",
+                                      {}).get("summary_source")
+    if summary_source:
+        summary += f"\nsummary_source: {summary_source}"
+        for key in ("json_report", "op_log_json_report"):
+            if exported_run.get(key):
+                document = json.loads(exported_run[key])
+                document["summary_source"] = summary_source
+                exported_run[key] = json.dumps(document,
+                                               indent=2,
+                                               sort_keys=True)
+        json_report = exported_run.get("json_report", json_report)
+        op_log_json_report = exported_run.get("op_log_json_report",
+                                              op_log_json_report)
 
     report_text = summary
     if report:
@@ -1320,13 +1457,16 @@ def current_compile_config() -> dict[str, Any]:
         "debug_export_mode":
         _normalize_export_mode(_active_config.export_mode),
         "debug_record_capacity": int(_active_config.record_capacity),
+        "debug_timeline_enabled": bool(_active_config.timeline_enabled),
     }
 
 
 def activate(
     *,
+    auto_collect: bool = False,
     level: int | None = None,
     addr_level: int = _DEFAULT_ADDR_LEVEL,
+    timeline: Any = _USE_CURRENT_CONFIG,
     record_level: int | None = None,
     export_mode: Any = _USE_CURRENT_CONFIG,
     record_capacity: Any = _USE_CURRENT_CONFIG,
@@ -1347,6 +1487,7 @@ def activate(
     effective_level = record_level if record_level is not None else level
     if effective_level is None:
         effective_level = 1
+    effective_level = _normalize_record_level(effective_level)
     effective_addr_level = _normalize_addr_level(addr_level)
     effective_export_mode = (_export_mode if export_mode is _USE_CURRENT_CONFIG
                              else _normalize_export_mode(export_mode))
@@ -1361,11 +1502,14 @@ def activate(
     effective_export_raw_records = (_raw_record_export_enabled if
                                     export_raw_records is _USE_CURRENT_CONFIG
                                     else bool(export_raw_records))
+    effective_timeline = (_timeline_enabled if timeline is _USE_CURRENT_CONFIG
+                          else bool(timeline))
 
     _active_config = DebuggerConfig(
         enabled=True,
-        record_level=int(effective_level),
+        record_level=effective_level,
         addr_level=effective_addr_level,
+        timeline_enabled=effective_timeline,
         export_mode=effective_export_mode,
         record_capacity=effective_record_capacity,
         export_on_error=effective_export_on_error,
@@ -1378,7 +1522,8 @@ def activate(
 
     from .compiler import set_instrumentation_mode
 
-    set_instrumentation_mode("debugger")
+    set_instrumentation_mode(
+        "debugger_auto_numeric" if auto_collect else "debugger")
 
 
 def deactivate() -> None:
@@ -1487,10 +1632,20 @@ def launch_context(
                 import torch
 
                 torch.cuda.synchronize()
+            elif backend in {"gcu", "enflame"}:
+                import torch
+
+                torch.gcu.synchronize()
             elif backend in {"mthreads", "musa"}:
                 import torch
 
                 torch.musa.synchronize()
+            elif backend in {"cuda", "nvidia"}:
+                # FlagPrism: TransferEngine.syncExport synchronizes the exact
+                # launch stream after the device-to-host copy. A process-wide
+                # torch.cuda.synchronize() would also stall unrelated streams
+                # and is unnecessary for the CUDA driver-backed adapter.
+                pass
             else:
                 raise RuntimeError(
                     f"FlagPrism has no hidden-argument synchronization adapter "

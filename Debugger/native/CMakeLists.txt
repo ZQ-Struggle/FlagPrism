@@ -1,3 +1,4 @@
+include("${CMAKE_CURRENT_SOURCE_DIR}/../lib/Runtime/Enflame.cmake")
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   message(FATAL_ERROR
     "Debugger native bindings are built from the FlagTree CMake graph")
@@ -107,6 +108,7 @@ set_source_files_properties(
 )
 
 include("${DEBUGGER_ROOT}/lib/Runtime/CoreX.cmake")
+include("${DEBUGGER_ROOT}/lib/Runtime/CUDA.cmake")
 if(NOT FLAGPRISM_BACKEND STREQUAL "tianshu")
   include("${DEBUGGER_ROOT}/lib/Runtime/CANN.cmake")
 endif()

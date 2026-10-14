@@ -39,6 +39,14 @@ FLAGTREE_BACKEND=mthreads FLAGPRISM_BACKEND=mthreads \
 TRITON_BUILD_FLAGPRISM=ON python -m pip install . --no-build-isolation
 ```
 
+For NVIDIA, select the NVIDIA-only build. It compiles the CUDA/CUPTI path
+without requiring ROCm headers or libraries:
+
+```bash
+FLAGTREE_BACKEND=nvidia FLAGPRISM_BACKEND=nvidia \
+TRITON_BUILD_FLAGPRISM=ON python -m pip install . --no-build-isolation
+```
+
 ## Usage
 
 ### Basic usage
@@ -106,21 +114,47 @@ with profiler.scope("test2", {"bytes": 3000}):
 
 ### Backend and mode
 
-FlagTree Profiler supports `cupti`, `roctracer`, `instrumentation`, `cann`, and
-`tianshu` backends.
+FlagTree Profiler supports `nvidia`, `cupti`, `roctracer`, `instrumentation`,
+`cann`, `mthreads`, and `tianshu` backends.
 
-- **`cupti`**: Used for NVIDIA GPUs. It supports both the default profiling mode and `pcsampling` (instruction sampling).
+- **`nvidia`**: The default NVIDIA backend. It uses the in-process CUPTI
+  activity stream and supports the derived vendor metrics `launch_stats` (one
+  kernel activity record) and `kernel_duration` (activity duration in
+  microseconds). `launch_stats` also exposes CUPTI launch geometry, block
+  threads, registers per thread, shared/local-memory reservations, graph and
+  cluster properties when the driver supplies them. These are
+  activity-derived values, not hardware counters. The `memory` metric imports
+  CUPTI memcpy/memset activity bytes, direction and transfer-rate estimates;
+  it is not a DRAM utilization counter. The `instruction` metric reuses the
+  CUPTI PC-sampling path and exports sampled instruction/stall buckets; it is
+  sampling data rather than a raw PM counter. Requesting `instruction` enables
+  PC sampling automatically. NVIDIA vendor PC sampling is best effort: when
+  the driver denies performance-counter access (for example CUPTI error 35),
+  the base activity profile is still finalized and the reason is recorded in
+  `*.vendor.json` instead of aborting the application. The hardware-counter
+  metrics `occupancy`, `throughput`, `bandwidth`, and `instruction_count` use
+  the CUPTI range-profiler plus NVPW/Perfworks; their values are evaluated
+  per AutoRange kernel and exposed with the `*_percent` aliases where the
+  selected NVIDIA metric is a percentage. `bandwidth` is DRAM throughput as a
+  percentage of sustained peak, while `memory` remains the activity-derived
+  byte/rate stream. Hardware-counter sessions use Kernel Replay and therefore
+  take precedence over the optional PC-sampling `instruction` metric when
+  both are requested; the disabled path is recorded as a degradation.
+- **`cupti`**: The legacy NVIDIA collector. Select it explicitly for
+  `pcsampling` (instruction sampling) or compatibility with existing traces.
+  The NVIDIA vendor backend also accepts `pcsampling` as a mode token when
+  combined with `vendor_metrics`.
 - **`roctracer`**: Used for AMD GPUs. It supports only the default profiling mode.
 - **`instrumentation`**: Available on both NVIDIA and AMD GPUs, this backend enables collection of custom metrics and advanced instrumentation.
 - **`cann`**: Uses the Ascend vendor adapter and CANN runtime/import path.
 - **`mthreads`**: Uses the native MUPTI callback/activity interface. The
-  currently enabled vendor metric is `launch_stats`, which reports kernel
-  launch timing, geometry and resource fields when the SDK supplies them.
+  in-process path reports launch geometry, theoretical occupancy, static
+  resource usage and theoretical peak memory bandwidth.
 - **`tianshu`**: Reuses Debugger instrumentation through the CoreX-compatible
   driver and imports ixKN CSV output. Use the `flagtree-profiler --ixkn` CLI
   wrapper because ixKN profiles the target process from startup.
 
-By default, FlagTree Profiler automatically selects `cupti`, `roctracer`,
+By default, FlagTree Profiler automatically selects `nvidia`, `roctracer`,
 `cann`, `mthreads`, or `tianshu` based on the active target backend. The `instrumentation`
 backend offers a wide range of mode options for fine-grained profiling, as
 detailed in the `mode.py` file.
@@ -135,7 +169,8 @@ import flagtree.profiler as profiler
 profiler.start(
     name="mthreads_profile",
     backend="mthreads",
-    mode="runtime_base:vendor_metrics=launch_stats",
+    mode=("runtime_base:vendor_metrics=launch_stats,occupancy,"
+          "resource_usage,peak_memory_bandwidth"),
 )
 # launch Triton kernels
 profiler.finalize()
@@ -148,11 +183,22 @@ runtimes where the activity-buffer path is known to be stable; MUSA 4.3 can
 retain incomplete activity buffers during shutdown. An explicit
 `mupti_import_path=<csv>` remains available for import-only validation.
 
-Hardware-counter metrics such as occupancy, bandwidth and instruction counts
-are not currently enabled for mthreads. MUSA's modern profiler target API needs
-counter configuration and evaluation support (normally supplied through the
-Perfworks layer), which is not integrated in FlagPrism yet. Unsupported metric
-names are reported as degraded instead of being silently fabricated.
+`occupancy` is calculated from the real MUSA occupancy API and the device's
+maximum resident-thread limit. `resource_usage` includes registers and shared
+memory per block and their share of the per-MP limits.
+`peak_memory_bandwidth` is a device-property-derived theoretical peak; it is
+not achieved bandwidth. `estimated_cycles` is available only with a stable
+MUPTI activity stream or an imported export because callback duration is host
+API time, not kernel execution time.
+
+Replay-based `instruction_count`, `cycles`, `memory_bandwidth`,
+`sm_utilization`, and arbitrary `hardware_counters` are currently disabled.
+The retained MCU wrapper and CSV importer are not exposed through the CLI.
+Requests for these metrics produce an explicit degradation reason while the
+in-process metrics remain usable.
+
+<!-- TODO(FlagPrism): Enable and validate MCU integration when a compatible
+Moore Threads MCU, MUSA SDK, and driver test environment is available. -->
 
 #### Instruction Sampling
 
